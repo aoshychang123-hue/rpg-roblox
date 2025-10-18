@@ -1,0 +1,317 @@
+--!strict
+-- EquipUtil
+-- - Sword (Right Arm): mantiene la lógica anterior con RightGrip, attachments, fade y anim opcional.
+-- - Shield (Left Arm): cambia a Motor6D directo en Left Arm (sin welds ni attachments):
+--     joint.Name = "Shield1"; joint.Parent = LeftArm; joint.Part0 = LeftArm; joint.Part1 = BasePart del escudo.
+
+local TweenService = game:GetService("TweenService")
+local RS = game:GetService("ReplicatedStorage")
+
+local assets = RS:WaitForChild("Assets")
+local modelsFolder = assets:WaitForChild("Models")
+
+export type AttachParams = {
+	Character: Model,
+	ModelPath: string?,               -- default "Sword1" para Right; "Shield1" para Left
+	FadeIn: number?,                  -- default 0.08 (sólo Sword)
+	FadeOut: number?,                 -- default 0.12 (sólo Sword)
+	ForwardOffset: number?,           -- default 0.2 (sólo Sword, desplaza en C0.z)
+	Duration: number?,                -- si se provee (sólo Sword), autodestruye tras ese tiempo
+	SwordAnimName: string?,           -- anim interna del modelo (sólo Sword)
+	SwordAnimFadeIn: number?,         -- default 0.05 (sólo Sword)
+	SwordAnimFadeOut: number?,        -- default 0.05 (sólo Sword)
+	SwordAnimSpeed: number?,          -- default 1 (sólo Sword)
+	Looped: boolean?,                 -- default false (sólo Sword)
+}
+
+export type Equipped = {
+	model: Model | BasePart,
+	handle: BasePart,
+	joint: Motor6D?,                  -- Sword: "RightGrip" parentado en el modelo; Shield: "Shield1" parentado en LeftArm
+	track: AnimationTrack?,           -- sólo Sword
+	destroy: () -> (),
+}
+
+local EquipUtil = {}
+
+-- Helpers comunes -------------------------------------------------------------
+
+local function findRightArm(character: Model): BasePart?
+	-- Soporta R6/R15
+	return character:FindFirstChild("Right Arm", true)
+		or character:FindFirstChild("RightHand", true)
+		or character:FindFirstChild("RightLowerArm", true)
+		or character:FindFirstChild("RightUpperArm", true)
+end
+
+local function findLeftArm(character: Model): BasePart?
+	-- Soporta R6/R15
+	return character:FindFirstChild("Left Arm", true)
+		or character:FindFirstChild("LeftHand", true)
+		or character:FindFirstChild("LeftLowerArm", true)
+		or character:FindFirstChild("LeftUpperArm", true)
+end
+
+-- Sword helpers (lógica existente) -------------------------------------------
+
+local function getSwordRightGrip(model: Instance): BasePart?
+	local inst = model:FindFirstChild("RightGrip", true)
+	if inst and inst:IsA("BasePart") then
+		return inst
+	end
+	return nil
+end
+
+local function getAttachment(part: BasePart, name: string): Attachment?
+	local att = part:FindFirstChild(name)
+	if att and att:IsA("Attachment") then return att end
+	for _, d in ipairs(part:GetDescendants()) do
+		if d:IsA("Attachment") and d.Name == name then
+			return d
+		end
+	end
+	return nil
+end
+
+local function tweenTransparency(parts: { BasePart }, target: number, timeSec: number)
+	if timeSec <= 0 then
+		for _, p in ipairs(parts) do
+			p.LocalTransparencyModifier = target
+		end
+		return
+	end
+	for _, p in ipairs(parts) do
+		local tw = TweenService:Create(
+			p,
+			TweenInfo.new(timeSec, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+			{ LocalTransparencyModifier = target }
+		)
+		tw:Play()
+	end
+end
+
+local function collectParts(root: Instance): { BasePart }
+	local arr: { BasePart } = {}
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") then
+			table.insert(arr, d)
+		end
+	end
+	if root:IsA("BasePart") then
+		table.insert(arr, root)
+	end
+	return arr
+end
+
+local function ensureAnimator(root: Instance): Animator
+	local ac = root:FindFirstChildOfClass("AnimationController")
+	if not ac then
+		ac = Instance.new("AnimationController")
+		ac.Name = "AnimationController"
+		ac.Parent = root
+	end
+	local animator = ac:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = ac
+	end
+	return animator
+end
+
+local function findAnimation(root: Instance, preferName: string?): Animation?
+	if preferName then
+		local found = root:FindFirstChild(preferName, true)
+		if found and found:IsA("Animation") then return found end
+	end
+	for _, folderName in ipairs({ "Animations", "Anim", "Animation", "Anims" }) do
+		local f = root:FindFirstChild(folderName)
+		if f then
+			for _, d in ipairs(f:GetDescendants()) do
+				if d:IsA("Animation") then return d end
+			end
+		end
+	end
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("Animation") then return d end
+	end
+	return nil
+end
+
+-- Sword: AttachToRightArm ----------------------------------------------------
+
+function EquipUtil.AttachToRightArm(params: AttachParams): Equipped?
+	local character = params.Character
+	if not character or not character.Parent then return nil end
+
+	local modelName = params.ModelPath or "Sword1"
+	local fadeIn = params.FadeIn or 0.08
+	local fadeOut = params.FadeOut or 0.12
+	local forwardOffset = params.ForwardOffset or 0.2
+	local duration = params.Duration
+
+	local swordAnimName = params.SwordAnimName
+	local animFadeIn = params.SwordAnimFadeIn or 0.05
+	local animFadeOut = params.SwordAnimFadeOut or 0.05
+	local animSpeed = params.SwordAnimSpeed or 1
+	local looped = params.Looped == true
+
+	local template = modelsFolder:FindFirstChild(modelName)
+	if not template then
+		warn("[EquipUtil] Modelo no encontrado en Assets/Models:", modelName)
+		return nil
+	end
+	local sword = template:Clone()
+	sword.Name = modelName
+	sword.Parent = character
+
+	local rightArm = findRightArm(character)
+	if not rightArm then
+		warn("[EquipUtil] No se encontró Right Arm/Hand en el character")
+		sword:Destroy()
+		return nil
+	end
+
+	local grip = getSwordRightGrip(sword)
+	if not grip then
+		warn("[EquipUtil] No se encontró BasePart 'RightGrip' dentro de la espada")
+		sword:Destroy()
+		return nil
+	end
+
+	local armAtt = getAttachment(rightArm, "RightGripAttachment")
+	local swordAtt = getAttachment(grip, "RightGripAttachment")
+
+	if sword:IsA("Model") and sword.PrimaryPart then
+		sword:PivotTo(rightArm.CFrame)
+	elseif sword:IsA("BasePart") then
+		sword.CFrame = rightArm.CFrame
+	end
+
+	local joint = Instance.new("Motor6D")
+	joint.Name = "RightGrip"
+	joint.Part0 = rightArm
+	joint.Part1 = grip
+	joint.C0 = (armAtt and armAtt.CFrame or CFrame.new()) * CFrame.new(0, 0, -math.abs(forwardOffset))
+	joint.C1 = swordAtt and swordAtt.CFrame or CFrame.new()
+	joint.Parent = grip
+
+	local parts = collectParts(sword)
+	for _, p in ipairs(parts) do
+		p.LocalTransparencyModifier = 1
+	end
+	tweenTransparency(parts, 0, fadeIn)
+
+	local track: AnimationTrack? = nil
+	do
+		local anim = findAnimation(sword, swordAnimName)
+		if anim then
+			local animator = ensureAnimator(sword)
+			track = animator:LoadAnimation(anim)
+			track.Looped = looped
+			track:AdjustSpeed(animSpeed)
+			track:Play(animFadeIn, 1, 1)
+		end
+	end
+
+	local destroyed = false
+	local function destroy()
+		if destroyed then return end
+		destroyed = true
+		if track then
+			pcall(function() track:Stop(animFadeOut) end)
+			track = nil
+		end
+		tweenTransparency(parts, 1, fadeOut)
+		task.delay(fadeOut + 0.02, function()
+			if sword then sword:Destroy() end
+		end)
+	end
+
+	if duration and duration > 0 then
+		task.delay(duration, destroy)
+	end
+
+	return { model = sword, handle = grip, joint = joint, track = track, destroy = destroy }
+end
+
+-- Shield: AttachToLeftArm -----------------------------------------------------
+
+local function findAnyBasePart(root: Instance): BasePart?
+	if root:IsA("BasePart") then return root end
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") then return d end
+	end
+	return nil
+end
+
+function EquipUtil.AttachToLeftArm(params: AttachParams): Equipped?
+	local character = params.Character
+	if not character or not character.Parent then return nil end
+
+	local leftArm = findLeftArm(character)
+	if not leftArm then
+		warn("[EquipUtil] Left Arm no encontrado en el character.")
+		return nil
+	end
+
+	local modelName = params.ModelPath or "Shield1"
+	local template = modelsFolder:FindFirstChild(modelName)
+	if not template then
+		warn("[EquipUtil] Modelo no encontrado en Assets/Models:", modelName)
+		return nil
+	end
+
+	local clone = template:Clone()
+	clone.Name = modelName
+	clone.Parent = character
+
+	local shieldPart: BasePart? =
+		clone:FindFirstChild("Handle", true)
+		or clone:FindFirstChild("ShieldPart", true)
+
+	if not (shieldPart and shieldPart:IsA("BasePart")) then
+		if clone:IsA("Model") and clone.PrimaryPart and clone.PrimaryPart:IsA("BasePart") then
+			shieldPart = clone.PrimaryPart
+		else
+			shieldPart = findAnyBasePart(clone)
+		end
+	end
+
+	if not shieldPart then
+		warn("[EquipUtil] No se encontró ninguna BasePart dentro de", modelName)
+		clone:Destroy()
+		return nil
+	end
+
+	for _, p in ipairs(clone:GetDescendants()) do
+		if p:IsA("BasePart") then
+			p.Anchored = false
+			p.CanCollide = false
+			p.Massless = true
+		end
+	end
+	if clone:IsA("BasePart") then
+		clone.Anchored = false
+		clone.CanCollide = false
+		clone.Massless = true
+	end
+
+	shieldPart.CFrame = leftArm.CFrame
+
+	local joint = Instance.new("Motor6D")
+	joint.Name = "Shield1"
+	joint.Part0 = leftArm
+	joint.Part1 = shieldPart
+	joint.Parent = leftArm
+
+	local destroyed = false
+	local function destroy()
+		if destroyed then return end
+		destroyed = true
+		if clone and clone.Parent then clone:Destroy() end
+	end
+
+	return { model = clone, handle = shieldPart, joint = joint, track = nil, destroy = destroy }
+end
+
+return EquipUtil
